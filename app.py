@@ -74,8 +74,47 @@ print(f"  {len(df_papers):,} papers loaded")
 # ---------------------------------------------------------------------------
 MODELS: dict[str, dict] = {}
 
-def register_model(name: str, inputs: list[str], fn):
-    MODELS[name] = {"name": name, "inputs": inputs, "fn": fn}
+def register_model(name: str, inputs: list[str], fn, score_label: str = "score", score_info: str = ""):
+    MODELS[name] = {"name": name, "inputs": inputs, "fn": fn, "score_label": score_label, "score_info": score_info}
+
+_SCORE_INFO = {
+    "TF-IDF (baseline)": """\
+**Score:** cosine similarity (0 to 1)
+
+| Range | Signal |
+|---|---|
+| > 0.30 | Strong - very similar topic and vocabulary |
+| 0.15 - 0.30 | Good - clearly related work |
+| 0.05 - 0.15 | Weak - some shared terms, different focus |
+| < 0.05 | Noise - likely a false positive |
+
+Tip: use specific technical terms (e.g. *masked language modeling*, *contrastive learning*) for higher scores.
+""",
+    "SVD": """\
+**Score:** latent factor dot product similarity
+
+Higher = more co-citation overlap in the training graph.
+No fixed upper bound - use relative ranking, not absolute value.
+""",
+    "PageRank": """\
+**Score:** PageRank citation importance
+
+Reflects how often a paper is cited by other highly-cited papers.
+Results are filtered by selected categories, ranked by global importance.
+""",
+    "Hybrid": """\
+**Score:** weighted combination of TF-IDF + SVD + PageRank
+
+Balances content similarity, co-citation structure, and citation importance.
+""",
+}
+
+def _arxiv_title_link(arxiv_id: str, title: str) -> str:
+    return (
+        f'<a href="https://arxiv.org/abs/{arxiv_id}" target="_blank" '
+        f'style="color:#2563eb;text-decoration:underline;cursor:pointer;font-weight:500;">'
+        f'{title}</a>'
+    )
 
 # ---------------------------------------------------------------------------
 # TF-IDF — load pre-built artifacts if available, otherwise rebuild
@@ -114,10 +153,12 @@ else:
     print(f"  done: {_tfidf_mat.shape[0]:,} papers x {_tfidf_mat.shape[1]:,} terms")
 
 
+_COLS = ["rank", "arxiv_id", "year", "categories", "title", "score"]
+
 def _tfidf_recommend(query_text: str, query_cats: list[str], k: int = TOP_K) -> pd.DataFrame:
     query = query_text.strip()
     if not query and not query_cats:
-        return pd.DataFrame(columns=["rank", "arxiv_id", "year", "categories", "title", "score"])
+        return pd.DataFrame(columns=_COLS)
 
     if query:
         q_vec  = _tfidf_vec.transform([query])
@@ -138,18 +179,25 @@ def _tfidf_recommend(query_text: str, query_cats: list[str], k: int = TOP_K) -> 
     rows = []
     for rank, idx in enumerate(top_idx, start=1):
         row = paper_idx_to_row.loc[idx]
+        aid = row["arxiv_id"]
         rows.append({
             "rank":       rank,
-            "arxiv_id":   row["arxiv_id"],
+            "arxiv_id":   aid,
             "year":       int(row["year"]),
             "categories": row["categories"].split()[0] if row["categories"] else "",
-            "title":      row["title"],
+            "title":      _arxiv_title_link(aid, row["title"]),
             "score":      round(float(scores[idx]), 4),
         })
     return pd.DataFrame(rows)
 
 
-register_model(name="TF-IDF (baseline)", inputs=["text", "categories"], fn=_tfidf_recommend)
+register_model(
+    name="TF-IDF (baseline)",
+    inputs=["text", "categories"],
+    fn=_tfidf_recommend,
+    score_label="cosine similarity (0-1)",
+    score_info=_SCORE_INFO["TF-IDF (baseline)"],
+)
 
 # ---------------------------------------------------------------------------
 # Optional model loaders — teammates fill in the scoring logic
@@ -166,9 +214,9 @@ def _load_svd() -> bool:
     def _svd_recommend(query_text: str, query_cats: list[str], k: int = TOP_K) -> pd.DataFrame:
         # Sheetal: implement SVD query logic here.
         # user_factors and item_factors are available in this scope.
-        return pd.DataFrame(columns=["rank", "arxiv_id", "year", "categories", "title", "score"])
+        return pd.DataFrame(columns=_COLS)
 
-    register_model(name="SVD", inputs=["arxiv_id"], fn=_svd_recommend)
+    register_model(name="SVD", inputs=["arxiv_id"], fn=_svd_recommend, score_label="latent factor similarity", score_info=_SCORE_INFO["SVD"])
     return True
 
 
@@ -192,14 +240,14 @@ def _load_pagerank() -> bool:
                 "arxiv_id":   arxiv_id,
                 "year":       int(row["year"]),
                 "categories": row["categories"].split()[0] if row["categories"] else "",
-                "title":      row["title"],
+                "title":      _arxiv_title_link(arxiv_id, row["title"]),
                 "score":      round(score, 6),
             })
             if len(rows) >= k:
                 break
         return pd.DataFrame(rows)
 
-    register_model(name="PageRank", inputs=["categories"], fn=_pagerank_recommend)
+    register_model(name="PageRank", inputs=["categories"], fn=_pagerank_recommend, score_label="PageRank score (citation importance)", score_info=_SCORE_INFO["PageRank"])
     return True
 
 
@@ -227,12 +275,14 @@ print(f"models available: {list(MODELS.keys())}")
 
 def _model_inputs(model_name: str) -> tuple:
     if model_name not in MODELS:
-        return gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
-    inp = MODELS[model_name]["inputs"]
+        return gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), ""
+    m = MODELS[model_name]
+    inp = m["inputs"]
     return (
         gr.update(visible="text"       in inp),
         gr.update(visible="categories" in inp),
         gr.update(visible="arxiv_id"   in inp),
+        m.get("score_info", ""),
     )
 
 
@@ -264,9 +314,7 @@ def _recommend(model_name: str, query_text: str, query_cats: list, arxiv_id: str
 with gr.Blocks(title="ArXivists Citation Recommender", theme=gr.themes.Soft()) as demo:
     gr.Markdown(
         """
-        # ArXivists Citation Recommender
-        **CMPE 256 - San Jose State University**
-        *Talina Shrotriya - Sheetal Sattiraju - Manjula Ganesh*
+        # ArXivists Research Paper Recommender
 
         Enter a research topic, select arXiv categories, or both - then pick a model
         and click **Recommend** to get the top-10 papers you should cite.
@@ -282,7 +330,14 @@ with gr.Blocks(title="ArXivists Citation Recommender", theme=gr.themes.Soft()) a
             )
             text_input = gr.Textbox(
                 label="Query text (title / abstract / description)",
-                placeholder="e.g. graph neural networks for node classification",
+                value=(
+                    "We propose a self-attention transformer architecture pre-trained on large "
+                    "unlabeled text corpora using masked language modeling. The model learns "
+                    "deep bidirectional contextual representations and is fine-tuned on "
+                    "downstream NLP tasks including text classification, named entity "
+                    "recognition, and question answering, achieving state-of-the-art results "
+                    "on the GLUE benchmark."
+                ),
                 lines=4,
                 visible=True,
             )
@@ -297,18 +352,23 @@ with gr.Blocks(title="ArXivists Citation Recommender", theme=gr.themes.Soft()) a
                 visible=False,
             )
             recommend_btn = gr.Button("Recommend", variant="primary")
+            score_info_md = gr.Markdown(
+                value=MODELS[list(MODELS.keys())[0]].get("score_info", ""),
+                visible=True,
+            )
 
         with gr.Column(scale=2):
             summary_md    = gr.Markdown("Results will appear here.")
             results_table = gr.Dataframe(
                 headers=["rank", "arxiv_id", "year", "categories", "title", "score"],
+                datatype=["number", "str", "number", "str", "html", "number"],
                 wrap=True,
             )
 
     model_dropdown.change(
         fn=_model_inputs,
         inputs=[model_dropdown],
-        outputs=[text_input, cat_input, arxiv_input],
+        outputs=[text_input, cat_input, arxiv_input, score_info_md],
     )
     recommend_btn.click(
         fn=_recommend,
