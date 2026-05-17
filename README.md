@@ -54,22 +54,42 @@ Section 3 checks for `papers.csv` and `citations.csv` in Drive. If found, it set
 
 ### Run the Gradio UI locally
 
+**Step 1 — Train models in Colab and export**
+
+Run `notebook.ipynb` in Colab through Section 7. The export cell lists every file
+in the Drive folder with its size.
+
+**Step 2 — Download files from Drive**
+
+Download these files from `cmpe_256_project_files/` in Google Drive:
+
+| File | Size | Notes |
+|---|---|---|
+| `papers.csv` | ~60 MB | required |
+| `tfidf_vectorizer.pkl` | ~10 MB | required, saved by notebook after TF-IDF trains |
+| `tfidf_matrix.npz` | ~250 MB | recommended, skips ~60s rebuild at startup |
+| `svd_model.npz` | varies | optional, auto-loaded if present |
+| `pagerank_scores.json` | varies | optional, auto-loaded if present |
+| `hybrid_weights.json` | small | optional, auto-loaded if present |
+
+**Step 3 — Run the app**
+
 ```bash
 git clone https://github.com/Talina06/research-paper-recommender-system.git
 cd research-paper-recommender-system
-pip install gradio scikit-learn pandas numpy
+pip install gradio scikit-learn pandas numpy scipy
 
-# Download papers.csv and citations.csv from the shared Drive folder
-# and put them in the same directory as app.py
-
-python app.py
+python app.py --data-dir /path/to/downloaded/files
 # open http://127.0.0.1:7860
 ```
 
+If `--data-dir` is omitted, `app.py` looks for files in the current directory.
+
 ### Run the Gradio UI in Colab
 
-Run Section 7 in the notebook. It installs Gradio, copies `app.py` from Drive,
-and launches a public share link valid for 72 hours.
+Run Section 8 in the notebook. It installs Gradio, fetches `app.py` from Drive
+(or downloads it from GitHub if not there), and launches a public share link
+valid for 72 hours.
 
 ---
 

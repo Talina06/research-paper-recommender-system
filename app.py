@@ -1,15 +1,26 @@
 """
 ArXivists Citation Recommender — Gradio UI
-CMPE 256, San José State University
+CMPE 256, San Jose State University
 
-Run locally:  python app.py
-Run in Colab: !python app.py  (or paste the cells below)
+Run locally:
+    python app.py --data-dir /path/to/downloaded/files
+    # open http://127.0.0.1:7860
 
-The app loads papers.csv and citations.csv from DRIVE_DIR (or the local directory)
-and exposes each registered model through a unified interface.
+Run in Colab (Section 7 of notebook.ipynb):
+    %run /content/app.py
+
+Files needed in data-dir:
+    papers.csv               required — paper metadata
+    tfidf_vectorizer.pkl     recommended — skips ~60s rebuild on startup
+    tfidf_matrix.npz         recommended — skips matrix transform on startup
+    svd_model.npz            optional — auto-registered if present
+    pagerank_scores.json     optional — auto-registered if present
+    hybrid_weights.json      optional — auto-registered if present
 """
 
+import argparse
 import json
+import sys
 from pathlib import Path
 
 import gradio as gr
@@ -17,75 +28,104 @@ import numpy as np
 import pandas as pd
 
 # ---------------------------------------------------------------------------
-# Config — point to wherever your CSVs live
+# Data directory — Drive in Colab, or --data-dir / cwd locally
 # ---------------------------------------------------------------------------
-DRIVE_DIR  = Path("/content/drive/MyDrive/cmpe_256_project_files")
-LOCAL_DIR  = Path(".")                     # fallback when not in Colab
-DATA_DIR   = DRIVE_DIR if DRIVE_DIR.exists() else LOCAL_DIR
+_DRIVE_DIR = Path("/content/drive/MyDrive/cmpe_256_project_files")
 
-TOP_K      = 10
-ALL_CATS   = ["cs.LG", "cs.AI", "cs.CV", "cs.IR", "cs.CL", "stat.ML"]
+def _resolve_data_dir() -> Path:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--data-dir", default=None)
+    args, _ = parser.parse_known_args()
+    if args.data_dir:
+        p = Path(args.data_dir).expanduser().resolve()
+        if not p.exists():
+            sys.exit(f"ERROR: --data-dir {p} does not exist")
+        return p
+    if _DRIVE_DIR.exists():
+        return _DRIVE_DIR
+    return Path(".")
+
+DATA_DIR = _resolve_data_dir()
+TOP_K    = 10
+ALL_CATS = ["cs.LG", "cs.AI", "cs.CV", "cs.IR", "cs.CL", "stat.ML"]
 
 # ---------------------------------------------------------------------------
-# Load dataset
+# Load paper metadata
 # ---------------------------------------------------------------------------
-print(f"loading data from {DATA_DIR} …")
-df_papers = pd.read_csv(DATA_DIR / "papers.csv", dtype={"arxiv_id": str})
-df_papers["text"] = df_papers["text"].fillna("")
+_papers_path = DATA_DIR / "papers.csv"
+if not _papers_path.exists():
+    sys.exit(
+        f"ERROR: papers.csv not found in {DATA_DIR}\n"
+        "Download it from the shared Drive folder and re-run:\n"
+        "  python app.py --data-dir /path/to/files"
+    )
+
+print(f"loading data from {DATA_DIR} ...")
+df_papers = pd.read_csv(_papers_path, dtype={"arxiv_id": str})
+df_papers["text"]       = df_papers["text"].fillna("")
 df_papers["categories"] = df_papers["categories"].fillna("")
 
 paper_idx_to_row = df_papers.set_index("paper_idx")
 arxiv_to_idx     = dict(zip(df_papers["arxiv_id"], df_papers["paper_idx"]))
-
 print(f"  {len(df_papers):,} papers loaded")
 
 # ---------------------------------------------------------------------------
 # Model registry
-# Each entry: {"name": str, "inputs": list["text"|"categories"|"arxiv_id"],
-#              "fn": callable(...) -> pd.DataFrame of top-K results}
 # ---------------------------------------------------------------------------
 MODELS: dict[str, dict] = {}
 
-
 def register_model(name: str, inputs: list[str], fn):
-    """Add a model to the registry."""
     MODELS[name] = {"name": name, "inputs": inputs, "fn": fn}
 
-
 # ---------------------------------------------------------------------------
-# Baseline: TF-IDF
+# TF-IDF — load pre-built artifacts if available, otherwise rebuild
 # ---------------------------------------------------------------------------
-print("building TF-IDF model …")
 from sklearn.feature_extraction.text import TfidfVectorizer
+import pickle
+import scipy.sparse as sp
 
-_tfidf_vec = TfidfVectorizer(
-    max_features=50_000,
-    min_df=3,
-    ngram_range=(1, 2),
-    sublinear_tf=True,
-    norm="l2",
-)
-_tfidf_mat = _tfidf_vec.fit_transform(df_papers["text"])
-print("  TF-IDF ready")
+_vec_path = DATA_DIR / "tfidf_vectorizer.pkl"
+_mat_path = DATA_DIR / "tfidf_matrix.npz"
+
+if _vec_path.exists() and _mat_path.exists():
+    print("loading TF-IDF from saved artifacts ...")
+    with open(_vec_path, "rb") as _f:
+        _tfidf_vec = pickle.load(_f)
+    _tfidf_mat = sp.load_npz(_mat_path)
+    print(f"  loaded: {_tfidf_mat.shape[0]:,} papers x {_tfidf_mat.shape[1]:,} terms")
+
+elif _vec_path.exists():
+    print("loading TF-IDF vectorizer, transforming matrix ...")
+    with open(_vec_path, "rb") as _f:
+        _tfidf_vec = pickle.load(_f)
+    _tfidf_mat = _tfidf_vec.transform(df_papers["text"])
+    print(f"  done: {_tfidf_mat.shape[0]:,} papers x {_tfidf_mat.shape[1]:,} terms")
+
+else:
+    print("building TF-IDF from scratch (no saved artifacts found, ~60s) ...")
+    _tfidf_vec = TfidfVectorizer(
+        max_features=50_000,
+        min_df=3,
+        ngram_range=(1, 2),
+        sublinear_tf=True,
+        norm="l2",
+    )
+    _tfidf_mat = _tfidf_vec.fit_transform(df_papers["text"])
+    print(f"  done: {_tfidf_mat.shape[0]:,} papers x {_tfidf_mat.shape[1]:,} terms")
 
 
 def _tfidf_recommend(query_text: str, query_cats: list[str], k: int = TOP_K) -> pd.DataFrame:
-    """
-    Score every paper by cosine similarity to the query text.
-    Optionally boost papers that share at least one category with the query.
-    """
     query = query_text.strip()
     if not query and not query_cats:
         return pd.DataFrame(columns=["rank", "arxiv_id", "year", "categories", "title", "score"])
 
-    # TF-IDF scores
     if query:
-        q_vec   = _tfidf_vec.transform([query])
-        scores  = (q_vec @ _tfidf_mat.T).toarray().ravel()
+        q_vec  = _tfidf_vec.transform([query])
+        scores = (q_vec @ _tfidf_mat.T).toarray().ravel()
     else:
         scores = np.zeros(len(df_papers), dtype=float)
 
-    # Category boost: +0.05 per shared category (small nudge, text still dominates)
+    # Small category boost (+0.05 per shared category); text still dominates
     if query_cats:
         cat_set = set(query_cats)
         for i, row_cats in enumerate(df_papers["categories"]):
@@ -109,48 +149,36 @@ def _tfidf_recommend(query_text: str, query_cats: list[str], k: int = TOP_K) -> 
     return pd.DataFrame(rows)
 
 
-register_model(
-    name   = "TF-IDF (baseline)",
-    inputs = ["text", "categories"],
-    fn     = _tfidf_recommend,
-)
+register_model(name="TF-IDF (baseline)", inputs=["text", "categories"], fn=_tfidf_recommend)
 
 # ---------------------------------------------------------------------------
-# Stub loaders for future models — teammates fill these in
+# Optional model loaders — teammates fill in the scoring logic
 # ---------------------------------------------------------------------------
 
 def _load_svd() -> bool:
-    """Load SVD model artefacts if available."""
     svd_path = DATA_DIR / "svd_model.npz"
     if not svd_path.exists():
         return False
-    data = np.load(svd_path)
+    data         = np.load(svd_path)
     user_factors = data["user_factors"]   # (n_papers, k)
     item_factors = data["item_factors"]   # (n_papers, k)
 
     def _svd_recommend(query_text: str, query_cats: list[str], k: int = TOP_K) -> pd.DataFrame:
-        # SVD needs an arxiv_id or paper_idx as query — text is not directly used.
-        # For demo: return most similar papers to a random seed paper.
-        # Sheetal: replace the query logic here.
+        # Sheetal: implement SVD query logic here.
+        # user_factors and item_factors are available in this scope.
         return pd.DataFrame(columns=["rank", "arxiv_id", "year", "categories", "title", "score"])
 
-    register_model(
-        name   = "SVD",
-        inputs = ["arxiv_id"],
-        fn     = _svd_recommend,
-    )
+    register_model(name="SVD", inputs=["arxiv_id"], fn=_svd_recommend)
     return True
 
 
 def _load_pagerank() -> bool:
-    """Load PageRank scores if available."""
     pr_path = DATA_DIR / "pagerank_scores.json"
     if not pr_path.exists():
         return False
     pr_scores = json.loads(pr_path.read_text())   # {arxiv_id: score}
 
     def _pagerank_recommend(query_text: str, query_cats: list[str], k: int = TOP_K) -> pd.DataFrame:
-        # PageRank returns globally popular papers, optionally filtered by category.
         cat_set = set(query_cats) if query_cats else None
         rows = []
         for arxiv_id, score in sorted(pr_scores.items(), key=lambda x: -x[1]):
@@ -171,29 +199,25 @@ def _load_pagerank() -> bool:
                 break
         return pd.DataFrame(rows)
 
-    register_model(
-        name   = "PageRank",
-        inputs = ["categories"],
-        fn     = _pagerank_recommend,
-    )
+    register_model(name="PageRank", inputs=["categories"], fn=_pagerank_recommend)
     return True
 
 
 def _load_hybrid() -> bool:
-    """Load hybrid model if available (SVD + TF-IDF + PageRank + category score)."""
     hybrid_path = DATA_DIR / "hybrid_weights.json"
     if not hybrid_path.exists():
         return False
-    # Manjula: implement hybrid scoring here
+    # Manjula: implement hybrid scoring here.
     return True
 
 
-# Try to load optional models
 for _loader in [_load_svd, _load_pagerank, _load_hybrid]:
     try:
-        _loader()
+        loaded = _loader()
+        if loaded:
+            print(f"  optional model loaded: {_loader.__name__}")
     except Exception as e:
-        print(f"  optional model skipped: {e}")
+        print(f"  optional model skipped ({_loader.__name__}): {e}")
 
 print(f"models available: {list(MODELS.keys())}")
 
@@ -202,7 +226,6 @@ print(f"models available: {list(MODELS.keys())}")
 # ---------------------------------------------------------------------------
 
 def _model_inputs(model_name: str) -> tuple:
-    """Return which input widgets are visible for the selected model."""
     if model_name not in MODELS:
         return gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
     inp = MODELS[model_name]["inputs"]
@@ -220,19 +243,19 @@ def _recommend(model_name: str, query_text: str, query_cats: list, arxiv_id: str
     model = MODELS[model_name]
     try:
         df = model["fn"](
-            query_text = query_text or "",
-            query_cats = query_cats or [],
-            k          = TOP_K,
+            query_text=query_text or "",
+            query_cats=query_cats or [],
+            k=TOP_K,
         )
     except Exception as e:
         return f"Error: {e}", pd.DataFrame()
 
     if df.empty:
-        return "No results — try different input.", pd.DataFrame()
+        return "No results - try different input.", pd.DataFrame()
 
     summary = (
         f"**{len(df)} recommendations** from **{model_name}**"
-        + (f" for query: *{query_text[:80]}…*" if query_text else "")
+        + (f" for query: *{query_text[:80]}...*" if query_text else "")
         + (f" | categories: {', '.join(query_cats)}" if query_cats else "")
     )
     return summary, df
@@ -241,11 +264,11 @@ def _recommend(model_name: str, query_text: str, query_cats: list, arxiv_id: str
 with gr.Blocks(title="ArXivists Citation Recommender", theme=gr.themes.Soft()) as demo:
     gr.Markdown(
         """
-        # 📄 ArXivists Citation Recommender
-        **CMPE 256 — San José State University**
-        *Talina Shrotriya · Sheetal Sattiraju · Manjula Ganesh*
+        # ArXivists Citation Recommender
+        **CMPE 256 - San Jose State University**
+        *Talina Shrotriya - Sheetal Sattiraju - Manjula Ganesh*
 
-        Enter a research topic, select arXiv categories, or both — then pick a model
+        Enter a research topic, select arXiv categories, or both - then pick a model
         and click **Recommend** to get the top-10 papers you should cite.
         """
     )
@@ -253,51 +276,44 @@ with gr.Blocks(title="ArXivists Citation Recommender", theme=gr.themes.Soft()) a
     with gr.Row():
         with gr.Column(scale=1):
             model_dropdown = gr.Dropdown(
-                choices = list(MODELS.keys()),
-                value   = list(MODELS.keys())[0],
-                label   = "Model",
+                choices=list(MODELS.keys()),
+                value=list(MODELS.keys())[0],
+                label="Model",
             )
-
             text_input = gr.Textbox(
-                label       = "Query text (title / abstract / description)",
-                placeholder = "e.g. graph neural networks for node classification",
-                lines       = 4,
-                visible     = True,
+                label="Query text (title / abstract / description)",
+                placeholder="e.g. graph neural networks for node classification",
+                lines=4,
+                visible=True,
             )
-
             cat_input = gr.CheckboxGroup(
-                choices = ALL_CATS,
-                label   = "arXiv categories (optional boost)",
-                visible = True,
+                choices=ALL_CATS,
+                label="arXiv categories (optional boost)",
+                visible=True,
             )
-
             arxiv_input = gr.Textbox(
-                label       = "arXiv ID (for ID-based models)",
-                placeholder = "e.g. 2301.12345",
-                visible     = False,
+                label="arXiv ID (for ID-based models)",
+                placeholder="e.g. 2301.12345",
+                visible=False,
             )
-
             recommend_btn = gr.Button("Recommend", variant="primary")
 
         with gr.Column(scale=2):
-            summary_md = gr.Markdown("Results will appear here.")
+            summary_md    = gr.Markdown("Results will appear here.")
             results_table = gr.Dataframe(
-                headers = ["rank", "arxiv_id", "year", "categories", "title", "score"],
-                wrap    = True,
+                headers=["rank", "arxiv_id", "year", "categories", "title", "score"],
+                wrap=True,
             )
 
-    # Wire up model switch → toggle visible inputs
     model_dropdown.change(
-        fn      = _model_inputs,
-        inputs  = [model_dropdown],
-        outputs = [text_input, cat_input, arxiv_input],
+        fn=_model_inputs,
+        inputs=[model_dropdown],
+        outputs=[text_input, cat_input, arxiv_input],
     )
-
-    # Wire up recommend button
     recommend_btn.click(
-        fn      = _recommend,
-        inputs  = [model_dropdown, text_input, cat_input, arxiv_input],
-        outputs = [summary_md, results_table],
+        fn=_recommend,
+        inputs=[model_dropdown, text_input, cat_input, arxiv_input],
+        outputs=[summary_md, results_table],
     )
 
     gr.Markdown(
@@ -305,11 +321,11 @@ with gr.Blocks(title="ArXivists Citation Recommender", theme=gr.themes.Soft()) a
         ---
         **Tips**
         - *TF-IDF*: enter any free-form research description; add categories for a small extra boost.
-        - *SVD / PageRank / Hybrid*: available once Sheetal & Manjula upload their model artefacts to Drive.
+        - *SVD / PageRank / Hybrid*: appear in the dropdown once their artefact files are present in data-dir.
         - Results are ranked by model score (higher = more similar / more relevant).
         """
     )
 
 
 if __name__ == "__main__":
-    demo.launch(share=True)
+    demo.launch(share=False)
