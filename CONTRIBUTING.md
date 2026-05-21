@@ -25,95 +25,131 @@ to add a new model, fix a bug, or improve the project.
    ```
 3. Install dependencies:
    ```bash
-   pip install gradio scikit-learn pandas numpy scipy matplotlib
+   pip install gradio scikit-learn pandas numpy scipy matplotlib torch gdown
    ```
-4. Download `papers.csv` and `citations.csv` from the shared Drive folder and place
-   them in the project root (same directory as `app.py`).
+4. Download the required data artifacts:
+   ```bash
+   python download_data.py --required-only   # papers.csv, citations.csv, TF-IDF files
+   python download_data.py                   # all model artifacts
+   ```
 
 ---
 
 ## Adding a new recommendation model
 
-This is the most common contribution. The project is designed so that adding a model
-requires no changes to shared infrastructure - just train, save, and plug in.
+### Step 1 — Train in the notebook
 
-### Step 1 - Train the model in the notebook
+Open `notebook.ipynb`. Sections 1–5 build the dataset and evaluation framework.
+Add your model as a new subsection in Section 7.
 
-Open `notebook.ipynb`. Sections 1-4 build the dataset and Section 5
-sets up the shared evaluation framework. Write your model in a new Section (7+) after
-the existing baseline.
-
-Use the shared evaluation helpers so your results are directly comparable:
+Use `_get_train_edges("My Model")` to get the appropriate training edges (warm papers
+only, or all papers, depending on `COLD_START_PER_MODEL`):
 
 ```python
-def my_batch_score_fn(indices: list[int]) -> np.ndarray:
-    # indices: list of paper_idx values (integers)
-    # return: np.ndarray of shape (len(indices), n_papers)
-    # higher score = more recommended
-    ...
+# Register your model in COLD_START_PER_MODEL (Section 5 eval framework cell)
+COLD_START_PER_MODEL["My Model"] = True  # True = warm papers only
 
-results = evaluate_model("My Model Name", batch_score_fn=my_batch_score_fn, batch_size=100)
-compare_models()
+# Train using _get_train_edges
+my_train_edges = _get_train_edges("My Model")
 ```
 
-For models that can only score one paper at a time, use `score_fn` instead:
+Evaluate with the shared framework so results are directly comparable:
 
 ```python
+# Batch scoring (preferred for matrix/embedding models — much faster):
+def my_batch_score_fn(indices: list[int]) -> np.ndarray:
+    # indices: list of paper_idx values
+    # return: np.ndarray shape (len(indices), n_papers) — higher = more recommended
+    ...
+
+evaluate_model("My Model", batch_score_fn=my_batch_score_fn, batch_size=100)
+
+# Per-paper scoring (for models where batching is awkward, e.g. PPR):
 def my_score_fn(query_idx: int) -> np.ndarray:
     # return shape (n_papers,) array
     ...
 
-evaluate_model("My Model Name", score_fn=my_score_fn)
+evaluate_model("My Model", score_fn=my_score_fn)
+compare_models()
 ```
 
-Both functions receive integer `paper_idx` values, not arXiv IDs.
+### Step 2 — Save the artifact to Drive
 
-### Step 2 - Save the model artefact to Drive
-
-Save to `cmpe_256_project_files/` using the expected filename so `app.py` picks it
-up automatically:
-
-| Model | File | Format |
-|---|---|---|
-| SVD | `svd_model.npz` | `np.savez(path, user_factors=U, item_factors=V)` where U, V are (n_papers, k) |
-| PageRank | `pagerank_scores.json` | `{"arxiv_id": float_score, ...}` |
-| Hybrid | `hybrid_weights.json` | `{"alpha": float, "beta": float, ...}` |
-
-### Step 3 - Implement the scoring stub in `app.py`
-
-Each model has a stub loader (`_load_svd`, `_load_pagerank`, `_load_hybrid`) that
-is called at startup. Fill in the `_recommend` function inside the loader:
+Run the export cell (Section 8). For a new model, add a save line before the export loop:
 
 ```python
-def _load_svd() -> bool:
-    svd_path = DATA_DIR / "svd_model.npz"
-    if not svd_path.exists():
-        return False
-    data         = np.load(svd_path)
-    user_factors = data["user_factors"]   # (n_papers, k)
-    item_factors = data["item_factors"]   # (n_papers, k)
+# Example: save a numpy embedding matrix
+np.save(OUTPUT_DIR / "my_embeddings.npy", my_embeddings)
 
-    def _svd_recommend(query_text: str, query_cats: list[str], k: int = TOP_K) -> pd.DataFrame:
-        # implement your scoring logic here
-        # return a DataFrame with columns: rank, arxiv_id, year, categories, title, score
-        ...
-
-    register_model(name="SVD", inputs=["arxiv_id"], fn=_svd_recommend)
-    return True
+# Example: save a PyTorch model
+torch.save(my_model.state_dict(), OUTPUT_DIR / "my_model.pt")
 ```
 
-The returned DataFrame must have exactly these columns in this order:
-`rank`, `arxiv_id`, `year`, `categories`, `title`, `score`.
+### Step 3 — Register in `app.py`
 
-### Step 4 - Test locally
+Add a loader block. Models use a text query as input — use `_text_to_paper_idx()` to
+find the closest paper by TF-IDF before applying graph/neural scoring:
+
+```python
+_my_path = DATA_DIR / "my_model.pt"
+if _my_path.exists():
+    # load artifact
+    _my_data = np.load(_my_path)   # or torch.load, etc.
+
+    def _my_recommend(query_text: str, query_cats: list[str], arxiv_id: str, k: int = TOP_K) -> pd.DataFrame:
+        if not query_text.strip():
+            return pd.DataFrame()
+
+        # For graph/neural models: anchor on closest TF-IDF paper
+        idx = _text_to_paper_idx(query_text)
+        if idx is None:
+            return pd.DataFrame()
+
+        scores = ...  # compute scores over all papers, shape (n_papers,)
+        scores[idx] = -np.inf   # exclude query paper itself
+
+        top_idx = np.argpartition(scores, -k)[-k:]
+        top_idx = top_idx[np.argsort(scores[top_idx])[::-1]]
+        return _build_result_df(top_idx, scores)
+
+    register_model(
+        name="My Model",
+        inputs=["text"],          # "text", "categories", or "arxiv_id"
+        fn=_my_recommend,
+        score_label="my score label",
+        score_info="**Score:** description of what the score means.",
+    )
+```
+
+`_build_result_df` returns a DataFrame with columns:
+`rank`, `arxiv_id`, `year`, `categories`, `title`, `abstract`, `score`.
+
+If the artifact file is missing, the block is simply skipped — the model won't appear
+in the dropdown. No error is raised.
+
+### Step 4 — Add to `download_data.py`
+
+Add an entry to the `FILES` list with the Google Drive file ID:
+
+```python
+("my_model.pt", "GOOGLE_DRIVE_FILE_ID", False, "My model weights"),
+```
+
+And add it to the `model_map` availability check:
+
+```python
+(["my_model.pt"], "My Model"),
+```
+
+### Step 5 — Test locally
 
 ```bash
-python app.py
+python app.py --data-dir ./data
 # visit http://127.0.0.1:7860
 # select your model from the dropdown and verify recommendations look reasonable
 ```
 
-### Step 5 - Open a pull request
+### Step 6 — Open a pull request
 
 See [Submitting a pull request](#submitting-a-pull-request).
 
@@ -124,11 +160,11 @@ See [Submitting a pull request](#submitting-a-pull-request).
 Open an issue on GitHub with:
 
 - A short description of what went wrong.
-- Steps to reproduce (notebook cell, input values, error message).
-- Environment info: Python version, key package versions, Colab or local.
+- Steps to reproduce (notebook cell or UI action, input values, error message).
+- Environment info: Python version, key package versions (`gradio`, `torch`, `sklearn`), Colab or local.
 
-If the bug is in the data pipeline (arXiv fetch or S2 fetch), include the
-checkpoint file names that were present when the error occurred.
+If the bug is in the data pipeline (arXiv fetch or S2 fetch), include the checkpoint
+file names present when the error occurred and the output of the failing cell.
 
 ---
 
@@ -138,21 +174,21 @@ checkpoint file names that were present when the error occurred.
    ```bash
    git checkout -b feature/my-model-name
    ```
-2. Make your changes. Keep commits focused - one logical change per commit.
-3. Verify the notebook runs end-to-end without errors (at least from Section 5
-   onwards if the full pipeline is too slow locally).
-4. Push and open a PR against `main` on the upstream repo.
-5. In the PR description, include your evaluation numbers from `compare_models()`
-   so reviewers can see the performance gain.
+2. Make your changes. Keep commits focused — one logical change per commit.
+3. Verify the notebook runs without errors from Section 5 onwards.
+4. Verify the app loads and your model appears in the dropdown.
+5. Push and open a PR against `main` on the upstream repo.
+6. Include your evaluation numbers from `compare_models()` in the PR description
+   so reviewers can see the performance impact.
 
 ---
 
 ## Code style
 
 - Python: follow PEP 8. Functions and variables use `snake_case`.
-- Keep notebook cells focused. One logical step per cell.
-- Do not commit large binary files (model weights, CSVs) to the repo. Those live
-  in the shared Drive folder.
-- No hard-coded file paths inside functions. Use `DATA_DIR` from the config cell.
-- New model loaders in `app.py` should degrade gracefully if the artefact file is
-  missing (return `False` without raising).
+- Keep notebook cells focused — one logical step per cell.
+- Do not commit binary files (model weights, CSVs) to the repo. Those live in Drive.
+- Use `OUTPUT_DIR` / `DATA_DIR` for all file paths — no hard-coded paths in functions.
+- New model loaders in `app.py` must degrade gracefully when the artifact is missing
+  (skip silently, do not raise).
+- Comments should explain *why*, not *what*. Avoid redundant comments that restate the code.
