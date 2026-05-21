@@ -17,7 +17,6 @@ Files needed in data-dir:
     pagerank_vector.npy      optional — enables PageRank
     gmf_model.pt             optional — enables GMF
     neumf_model.pt           optional — enables NeuMF
-    hybrid_gmf_model.pt      optional — enables HybridGMF
 """
 
 import argparse
@@ -76,11 +75,21 @@ df_papers["title"]      = df_papers["title"].fillna("")
 paper_idx_to_row = df_papers.set_index("paper_idx")
 arxiv_to_idx     = dict(zip(df_papers["arxiv_id"], df_papers["paper_idx"]))
 N_PAPERS         = len(df_papers)
+
+# Build citation adjacency for PPR — loads citations.csv if present
+from collections import defaultdict
+_ppr_adj: dict[int, list[int]] = defaultdict(list)
+_cit_path = DATA_DIR / "citations.csv"
+if _cit_path.exists():
+    print("building citation graph for PPR ...")
+    _cit_df = pd.read_csv(_cit_path, usecols=["source_idx", "target_idx"])
+    for src, tgt in zip(_cit_df["source_idx"], _cit_df["target_idx"]):
+        _ppr_adj[int(src)].append(int(tgt))
+    print(f"  {len(_ppr_adj):,} papers with outgoing citations")
 print(f"  {N_PAPERS:,} papers loaded")
 
-ALL_CATS = sorted(
-    {cat for cats in df_papers["categories"] for cat in str(cats).split() if "." in cat}
-)[:40]
+# Same domains as OAI_SETS in the notebook config
+ALL_CATS = ["cs", "math", "physics", "stat", "eess", "q-bio", "q-fin", "econ"]
 
 # ---------------------------------------------------------------------------
 # Model registry
@@ -103,33 +112,65 @@ def _arxiv_link(arxiv_id: str, title: str) -> str:
 def _build_result_df(top_idx: np.ndarray, scores: np.ndarray) -> pd.DataFrame:
     rows = []
     for rank, idx in enumerate(top_idx, start=1):
-        if idx not in paper_idx_to_row.index:
+        idx = int(idx)
+        if idx < 0 or idx >= len(scores) or idx not in paper_idx_to_row.index:
             continue
         row = paper_idx_to_row.loc[idx]
         aid = str(row["arxiv_id"])
+        score = float(scores[idx])
+        if not np.isfinite(score):
+            continue
+        if score < 0.001:
+            score_str = f"{score:.6f}"
+        else:
+            score_str = str(round(score, 4))
         rows.append({
             "rank":       rank,
             "arxiv_id":   aid,
             "year":       int(row.get("year", 0)),
-            "category":   str(row["categories"]).split()[0] if row["categories"] else "",
+            "categories": str(row["categories"]) if row["categories"] else "",
             "title":      _arxiv_link(aid, row["title"]),
-            "score":      round(float(scores[idx]), 4),
+            "abstract":   str(row.get("abstract", ""))[:300],
+            "score":      score_str,
         })
     return pd.DataFrame(rows)
 
 def _make_pie_chart(df_results: pd.DataFrame) -> plt.Figure:
-    counts = df_results["category"].value_counts()
+    # Count top-level domain for every category on every displayed paper.
+    # A paper with "cs.LG cs.AI stat.ML" contributes to cs and stat.
+    domain_counts: dict[str, int] = {}
+    for idx in df_results.index:
+        paper_idx = int(df_results.loc[idx, "rank"]) - 1  # rank is 1-based
+        # Use the full categories string from paper_idx_to_row via arxiv_id
+        aid = df_results.loc[idx, "arxiv_id"]
+        if aid in arxiv_to_idx:
+            pidx = arxiv_to_idx[aid]
+            if pidx in paper_idx_to_row.index:
+                cats_str = str(paper_idx_to_row.loc[pidx, "categories"])
+                for cat in cats_str.split():
+                    domain = cat.split(".")[0] if "." in cat else cat
+                    if domain in set(ALL_CATS):
+                        domain_counts[domain] = domain_counts.get(domain, 0) + 1
+
+    if not domain_counts:
+        # fallback: use the categories column already in df_results
+        domain_counts = df_results["categories"].apply(
+            lambda c: c.split(".")[0] if "." in str(c) else str(c)
+        ).value_counts().to_dict()
+
+    labels = list(domain_counts.keys())
+    values = list(domain_counts.values())
+
     fig, ax = plt.subplots(figsize=(5, 4))
-    wedge_props = {"edgecolor": "white", "linewidth": 1.2}
     ax.pie(
-        counts.values,
-        labels=counts.index,
+        values,
+        labels=labels,
         autopct="%1.0f%%",
         startangle=140,
-        wedgeprops=wedge_props,
+        wedgeprops={"edgecolor": "white", "linewidth": 1.2},
         textprops={"fontsize": 9},
     )
-    ax.set_title("Category Distribution\nof Recommendations", fontsize=10, pad=10)
+    ax.set_title(f"Domain Distribution\n({len(df_results)} recommendations)", fontsize=10, pad=10)
     fig.tight_layout()
     return fig
 
@@ -166,10 +207,14 @@ def _tfidf_recommend(query_text: str, query_cats: list[str], arxiv_id: str, k: i
         return pd.DataFrame()
     q_vec  = _tfidf_vec.transform([query_text.strip() or " ".join(query_cats)])
     scores = (q_vec @ _tfidf_mat.T).toarray().ravel()
+    n_scores = len(scores)
     if query_cats:
         cat_set = set(query_cats)
         for i, row_cats in enumerate(df_papers["categories"]):
-            scores[i] += 0.05 * len(cat_set & set(str(row_cats).split()))
+            if i >= n_scores:
+                break
+            paper_prefixes = {c.split(".")[0] for c in str(row_cats).split()}
+            scores[i] += 0.05 * len(cat_set & paper_prefixes)
     top_idx = np.argpartition(scores, -k)[-k:]
     top_idx = top_idx[np.argsort(scores[top_idx])[::-1]]
     return _build_result_df(top_idx, scores)
@@ -186,6 +231,14 @@ register_model(
     ),
 )
 
+def _text_to_paper_idx(query_text: str) -> int | None:
+    """Find the closest paper in the dataset to query_text using TF-IDF."""
+    if not query_text.strip() or _tfidf_mat is None:
+        return None
+    q_vec = _tfidf_vec.transform([query_text.strip()])
+    scores = (q_vec @ _tfidf_mat.T).toarray().ravel()
+    return int(np.argmax(scores))
+
 # ---------------------------------------------------------------------------
 # SVD — paper_embeddings.npy
 # ---------------------------------------------------------------------------
@@ -197,11 +250,12 @@ if _emb_path.exists():
     _paper_embeddings = np.load(_emb_path)
     print(f"  {_paper_embeddings.shape[0]:,} papers x {_paper_embeddings.shape[1]} dims")
 
+    _svd_n = _paper_embeddings.shape[0]
+
     def _svd_recommend(query_text: str, query_cats: list[str], arxiv_id: str, k: int = TOP_K) -> pd.DataFrame:
-        aid = arxiv_id.strip()
-        idx = arxiv_to_idx.get(aid)
-        if idx is None:
-            return pd.DataFrame(columns=["rank","arxiv_id","year","category","title","score"])
+        idx = _text_to_paper_idx(query_text)
+        if idx is None or idx >= _svd_n:
+            return pd.DataFrame()
         q_emb  = _paper_embeddings[idx]
         scores = _paper_embeddings @ q_emb
         scores[idx] = -np.inf
@@ -211,10 +265,10 @@ if _emb_path.exists():
 
     register_model(
         name="SVD",
-        inputs=["arxiv_id"],
+        inputs=["text"],
         fn=_svd_recommend,
         score_label="latent factor similarity",
-        score_info="**Score:** dot product of 128-dim SVD embeddings trained on citation co-occurrence.",
+        score_info="**Score:** finds the closest paper to your abstract via TF-IDF, then ranks by citation-graph SVD similarity.",
     )
 
 # ---------------------------------------------------------------------------
@@ -226,15 +280,19 @@ if _pr_path.exists():
     print("loading PageRank scores ...")
     _pr_vector = np.load(_pr_path)
 
+    _pr_n = _pr_vector.shape[0]
+
     def _pagerank_recommend(query_text: str, query_cats: list[str], arxiv_id: str, k: int = TOP_K) -> pd.DataFrame:
-        scores = _pr_vector.copy()
+        scores = _pr_vector[:N_PAPERS].copy()  # clamp to actual paper count
         if query_cats:
+            # match on domain prefix: "cs" matches "cs.LG", "cs.AI", etc.
             cat_set = set(query_cats)
-            mask = np.array([
-                not bool(cat_set & set(str(r["categories"]).split()))
-                for _, r in df_papers.iterrows()
-            ])
-            scores[mask] = -np.inf
+            for i, row_cats in enumerate(df_papers["categories"]):
+                if i >= len(scores):
+                    break
+                paper_prefixes = {c.split(".")[0] for c in str(row_cats).split()}
+                if not (cat_set & paper_prefixes):
+                    scores[i] = -np.inf
         top_idx = np.argpartition(scores, -k)[-k:]
         top_idx = top_idx[np.argsort(scores[top_idx])[::-1]]
         return _build_result_df(top_idx, scores)
@@ -248,18 +306,180 @@ if _pr_path.exists():
     )
 
 # ---------------------------------------------------------------------------
+# PPR-MC (requires citations.csv)
+# text → TF-IDF best match → PPR walks from that paper
+# ---------------------------------------------------------------------------
+if _ppr_adj and _tfidf_mat is not None:
+    import random as _random
+
+    _PPR_ALPHA    = 0.85
+    _PPR_WALKS    = 200
+    _PPR_WALK_LEN = 30
+
+    def _ppr_recommend(query_text: str, query_cats: list[str], arxiv_id: str, k: int = TOP_K) -> pd.DataFrame:
+        if not query_text.strip():
+            return pd.DataFrame()
+
+        # Step 1: find best matching paper in dataset via TF-IDF
+        anchor = _text_to_paper_idx(query_text)
+        if anchor is None:
+            return pd.DataFrame()
+
+        # Step 2: run PPR walks from that paper through the real citation graph
+        visits: dict[int, float] = defaultdict(float)
+        for _ in range(_PPR_WALKS):
+            node = anchor
+            for _ in range(_PPR_WALK_LEN):
+                visits[node] += 1.0
+                if _random.random() > _PPR_ALPHA:
+                    node = anchor
+                    continue
+                neighbors = _ppr_adj.get(node, [])
+                node = _random.choice(neighbors) if neighbors else anchor
+
+        n = _tfidf_mat.shape[0]
+        total = sum(visits.values())
+        scores = np.zeros(n, dtype=np.float32)
+        for nd, count in visits.items():
+            if nd < n:
+                scores[nd] = count / (total + 1e-10)
+        scores[anchor] = -np.inf  # exclude the anchor paper itself
+
+        top_idx = np.argpartition(scores, -k)[-k:]
+        top_idx = top_idx[np.argsort(scores[top_idx])[::-1]]
+        return _build_result_df(top_idx, scores)
+
+    register_model(
+        name="PPR-MC",
+        inputs=["text"],
+        fn=_ppr_recommend,
+        score_label="PPR visit frequency",
+        score_info=(
+            "**Score:** Personalized PageRank on the citation graph. "
+            "Your abstract is matched to the closest paper via TF-IDF, "
+            "then PPR walks from that paper surface its citation neighborhood."
+        ),
+    )
+
+# ---------------------------------------------------------------------------
+# TF-IDF + PPR-MC Ensemble (requires citations.csv + tfidf artifacts)
+# ---------------------------------------------------------------------------
+if _ppr_adj and _tfidf_mat is not None:
+    _ENS_ALPHA = 0.5  # weight on PPR-MC; (1 - alpha) on TF-IDF
+
+    def _ensemble_recommend(query_text: str, query_cats: list[str], arxiv_id: str, k: int = TOP_K) -> pd.DataFrame:
+        if not query_text.strip():
+            return pd.DataFrame()
+
+        n = _tfidf_mat.shape[0]
+
+        # TF-IDF scores
+        q_vec = _tfidf_vec.transform([query_text.strip()])
+        tfidf_s = (q_vec @ _tfidf_mat.T).toarray().ravel().astype(np.float64)
+
+        # PPR scores — anchor on best TF-IDF match
+        anchor = int(np.argmax(tfidf_s))
+        visits: dict[int, float] = defaultdict(float)
+        for _ in range(_PPR_WALKS):
+            node = anchor
+            for _ in range(_PPR_WALK_LEN):
+                visits[node] += 1.0
+                if _random.random() > _PPR_ALPHA:
+                    node = anchor
+                    continue
+                neighbors = _ppr_adj.get(node, [])
+                node = _random.choice(neighbors) if neighbors else anchor
+        total = sum(visits.values())
+        ppr_s = np.zeros(n, dtype=np.float64)
+        for nd, count in visits.items():
+            if nd < n:
+                ppr_s[nd] = count / (total + 1e-10)
+
+        # min-max normalise then blend
+        def _norm(v):
+            lo, hi = v.min(), v.max()
+            return (v - lo) / (hi - lo + 1e-10)
+
+        scores = _ENS_ALPHA * _norm(ppr_s) + (1.0 - _ENS_ALPHA) * _norm(tfidf_s)
+        scores[anchor] = -np.inf
+
+        top_idx = np.argpartition(scores, -k)[-k:]
+        top_idx = top_idx[np.argsort(scores[top_idx])[::-1]]
+        return _build_result_df(top_idx, scores)
+
+    register_model(
+        name="TF-IDF + PPR-MC",
+        inputs=["text"],
+        fn=_ensemble_recommend,
+        score_label="blended score (TF-IDF + PPR-MC)",
+        score_info="**Score:** 50% TF-IDF cosine similarity + 50% PPR visit frequency, both min-max normalised.",
+    )
+
+# ---------------------------------------------------------------------------
+# Epsilon-Greedy Bandit (requires tfidf artifacts)
+# ---------------------------------------------------------------------------
+if _tfidf_mat is not None:
+    _EG_EPSILON   = 0.1
+    _EG_POOL_SIZE = 500
+    _EG_SIM_STEPS = 50
+
+    def _eg_recommend(query_text: str, query_cats: list[str], arxiv_id: str, k: int = TOP_K) -> pd.DataFrame:
+        if not query_text.strip():
+            return pd.DataFrame()
+
+        # Candidate pool: top-_EG_POOL_SIZE by TF-IDF
+        q_vec = _tfidf_vec.transform([query_text.strip()])
+        sims  = (q_vec @ _tfidf_mat.T).toarray().ravel()
+        pool_size = min(_EG_POOL_SIZE, len(sims))
+        candidates = np.argpartition(sims, -pool_size)[-pool_size:].tolist()
+
+        # Epsilon-greedy bandit over the candidate pool
+        counts = np.zeros(pool_size)
+        values = np.zeros(pool_size)
+        item_arr = np.array(candidates)
+
+        for _ in range(_EG_SIM_STEPS):
+            if _random.random() < _EG_EPSILON or not values.any():
+                i = _random.randrange(pool_size)
+            else:
+                i = int(np.argmax(values))
+            # reward = TF-IDF similarity (proxy for relevance)
+            reward = float(sims[item_arr[i]])
+            counts[i] += 1
+            values[i] += (reward - values[i]) / counts[i]
+
+        # Rank by learned values
+        ranked = item_arr[np.argsort(values)[::-1]]
+        scores = np.full(len(sims), -np.inf)
+        for rank, idx in enumerate(ranked):
+            scores[idx] = float(values[np.where(item_arr == idx)[0][0]])
+
+        top_idx = ranked[:k]
+        return _build_result_df(top_idx, scores)
+
+    register_model(
+        name="Epsilon-Greedy",
+        inputs=["text"],
+        fn=_eg_recommend,
+        score_label="bandit value estimate",
+        score_info="**Score:** Epsilon-greedy bandit reranking over a TF-IDF candidate pool of 500 papers.",
+    )
+
+# ---------------------------------------------------------------------------
 # Hybrid TF-IDF + SVD (requires both artifacts)
 # ---------------------------------------------------------------------------
 if _tfidf_mat is not None and _paper_embeddings is not None:
+    _hybrid_n = min(_tfidf_mat.shape[0], _paper_embeddings.shape[0])
+
     def _hybrid_recommend(query_text: str, query_cats: list[str], arxiv_id: str, k: int = TOP_K) -> pd.DataFrame:
         if not query_text.strip():
             return pd.DataFrame()
-        # TF-IDF cosine scores
+        # TF-IDF cosine scores (clipped to the common size)
         q_vec    = _tfidf_vec.transform([query_text.strip()])
-        tfidf_s  = (q_vec @ _tfidf_mat.T).toarray().ravel().astype(np.float64)
+        tfidf_s  = (q_vec @ _tfidf_mat.T).toarray().ravel().astype(np.float64)[:_hybrid_n]
         # SVD scores via TF-IDF query proxy: find closest paper then use its embedding
         top1 = int(np.argmax(tfidf_s))
-        svd_s = (_paper_embeddings @ _paper_embeddings[top1]).astype(np.float64)
+        svd_s = (_paper_embeddings[:_hybrid_n] @ _paper_embeddings[top1]).astype(np.float64)
         # min-max normalise then blend 50/50
         def _norm(v):
             lo, hi = v.min(), v.max()
@@ -300,30 +520,33 @@ def _load_gmf() -> bool:
                 v = self.item_embedding(item_idx)
                 return self.sigmoid(self.fc(u * v))
 
-        n = N_PAPERS
+        # Load state dict first to infer the embedding size the model was trained with
+        _sd = torch.load(gmf_path, map_location="cpu", weights_only=True)
+        n = _sd["user_embedding.weight"].shape[0]
         _gmf = _GMF(n, n, embedding_dim=32)
-        _gmf.load_state_dict(torch.load(gmf_path, map_location="cpu", weights_only=True))
+        _gmf.load_state_dict(_sd)
         _gmf.eval()
         _all_items = torch.arange(n, dtype=torch.long)
 
         def _gmf_recommend(query_text: str, query_cats: list[str], arxiv_id: str, k: int = TOP_K) -> pd.DataFrame:
-            idx = arxiv_to_idx.get(arxiv_id.strip())
-            if idx is None:
+            idx = _text_to_paper_idx(query_text)
+            if idx is None or idx >= n:
                 return pd.DataFrame()
             with torch.no_grad():
                 u = torch.tensor([idx], dtype=torch.long)
                 scores = _gmf(u, _all_items).squeeze().numpy()
-            scores[idx] = -np.inf
+            if idx < len(scores):
+                scores[idx] = -np.inf
             top_idx = np.argpartition(scores, -k)[-k:]
             top_idx = top_idx[np.argsort(scores[top_idx])[::-1]]
             return _build_result_df(top_idx, scores)
 
         register_model(
             name="GMF",
-            inputs=["arxiv_id"],
+            inputs=["text"],
             fn=_gmf_recommend,
             score_label="GMF score",
-            score_info="**Score:** neural GMF sigmoid output. Trained on citation co-occurrence with warm-start papers.",
+            score_info="**Score:** finds the closest paper to your abstract via TF-IDF, then ranks by neural GMF citation similarity.",
         )
         return True
     except Exception as e:
@@ -354,7 +577,7 @@ def _load_neumf() -> bool:
                 for out_dim in mlp_dims[1:]:
                     layers += [nn.Linear(in_dim, out_dim), nn.ReLU()]
                     in_dim = out_dim
-                self.mlp = nn.Sequential(*layers)
+                self.mlp_network = nn.Sequential(*layers)
                 self.fc_final = nn.Linear(gmf_dim + mlp_dims[-1], 1)
                 self.sigmoid   = nn.Sigmoid()
 
@@ -364,33 +587,35 @@ def _load_neumf() -> bool:
                 gmf_out = gmf_u * gmf_v
                 mlp_u = self.mlp_user_emb(user_idx)
                 mlp_v = self.mlp_item_emb(item_idx)
-                mlp_out = self.mlp(torch.cat([mlp_u, mlp_v], dim=-1))
+                mlp_out = self.mlp_network(torch.cat([mlp_u, mlp_v], dim=-1))
                 return self.sigmoid(self.fc_final(torch.cat([gmf_out, mlp_out], dim=-1)))
 
-        n = N_PAPERS
+        _sd = torch.load(neumf_path, map_location="cpu", weights_only=True)
+        n = _sd["gmf_user_emb.weight"].shape[0]
         _neumf = _NeuMF(n, n)
-        _neumf.load_state_dict(torch.load(neumf_path, map_location="cpu", weights_only=True))
+        _neumf.load_state_dict(_sd)
         _neumf.eval()
         _all_items = torch.arange(n, dtype=torch.long)
 
         def _neumf_recommend(query_text: str, query_cats: list[str], arxiv_id: str, k: int = TOP_K) -> pd.DataFrame:
-            idx = arxiv_to_idx.get(arxiv_id.strip())
-            if idx is None:
+            idx = _text_to_paper_idx(query_text)
+            if idx is None or idx >= n:
                 return pd.DataFrame()
             with torch.no_grad():
                 u = torch.tensor([idx], dtype=torch.long).expand(n)
                 scores = _neumf(u, _all_items).squeeze().numpy()
-            scores[idx] = -np.inf
+            if idx < len(scores):
+                scores[idx] = -np.inf
             top_idx = np.argpartition(scores, -k)[-k:]
             top_idx = top_idx[np.argsort(scores[top_idx])[::-1]]
             return _build_result_df(top_idx, scores)
 
         register_model(
             name="NeuMF",
-            inputs=["arxiv_id"],
+            inputs=["text"],
             fn=_neumf_recommend,
             score_label="NeuMF score",
-            score_info="**Score:** NeuMF sigmoid (GMF branch + MLP branch). Captures both linear and non-linear citation patterns.",
+            score_info="**Score:** finds the closest paper to your abstract via TF-IDF, then ranks by NeuMF citation similarity (GMF + MLP).",
         )
         return True
     except Exception as e:
@@ -414,7 +639,7 @@ def _model_inputs(model_name: str):
         return gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), ""
     inp = MODELS[model_name]["inputs"]
     return (
-        gr.update(visible="text"       in inp),
+        gr.update(visible=True),                        # text always shown
         gr.update(visible="categories" in inp),
         gr.update(visible="arxiv_id"   in inp),
         MODELS[model_name].get("score_info", ""),
@@ -471,11 +696,11 @@ with gr.Blocks(title="ArXivists Citation Recommender", theme=gr.themes.Soft()) a
                     "on GLUE, SQuAD, and named entity recognition benchmarks."
                 ),
                 lines=5,
-                visible="text" in MODELS[_first_model]["inputs"],
+                visible=True,
             )
             cat_input = gr.CheckboxGroup(
-                choices=ALL_CATS[:20],
-                label="arXiv categories (optional filter/boost)",
+                choices=ALL_CATS,
+                label="arXiv domains (optional filter/boost)",
                 visible="categories" in MODELS[_first_model]["inputs"],
             )
             arxiv_input = gr.Textbox(
@@ -491,8 +716,8 @@ with gr.Blocks(title="ArXivists Citation Recommender", theme=gr.themes.Soft()) a
         with gr.Column(scale=2):
             summary_md    = gr.Markdown("Results will appear here.")
             results_table = gr.Dataframe(
-                headers=["rank", "arxiv_id", "year", "category", "title", "score"],
-                datatype=["number", "str", "number", "str", "html", "number"],
+                headers=["rank", "arxiv_id", "year", "categories", "title", "abstract", "score"],
+                datatype=["number", "str", "number", "str", "html", "str", "str"],
                 wrap=True,
             )
             pie_chart = gr.Plot(label="Category distribution")
