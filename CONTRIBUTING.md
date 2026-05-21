@@ -25,13 +25,11 @@ to add a new model, fix a bug, or improve the project.
    ```
 3. Install dependencies:
    ```bash
-   pip install gradio scikit-learn pandas numpy scipy matplotlib torch gdown
+   pip install gradio scikit-learn pandas numpy scipy matplotlib torch
    ```
-4. Download the required data artifacts:
-   ```bash
-   python download_data.py --required-only   # papers.csv, citations.csv, TF-IDF files
-   python download_data.py                   # all model artifacts
-   ```
+4. Download the required data artifacts from the shared Google Drive folder
+   (`cmpe_256_project_files/`) — at minimum: `papers.csv`, `citations.csv`,
+   `tfidf_vectorizer.pkl`, `tfidf_matrix.npz`.
 
 ---
 
@@ -127,21 +125,7 @@ if _my_path.exists():
 If the artifact file is missing, the block is simply skipped — the model won't appear
 in the dropdown. No error is raised.
 
-### Step 4 — Add to `download_data.py`
-
-Add an entry to the `FILES` list with the Google Drive file ID:
-
-```python
-("my_model.pt", "GOOGLE_DRIVE_FILE_ID", False, "My model weights"),
-```
-
-And add it to the `model_map` availability check:
-
-```python
-(["my_model.pt"], "My Model"),
-```
-
-### Step 5 — Test locally
+### Step 4 — Test locally
 
 ```bash
 python app.py --data-dir ./data
